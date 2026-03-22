@@ -1,5 +1,14 @@
 env-setup/
-gpu-app-collection/
+# Allow traversal of gpu-app-collection
+!gpu-app-collection/
+# Still ignore everything else inside gpu-app-collection
+gpu-app-collection/*
+# Specifically unignore custom-divergence-bms
+!gpu-app-collection/src/
+gpu-app-collection/src/*
+!gpu-app-collection/src/cuda/
+gpu-app-collection/src/cuda/*
+!gpu-app-collection/src/cuda/custom-divergence-bms/
 hw_run/
 sim_run_*
 *.DS_Store*
