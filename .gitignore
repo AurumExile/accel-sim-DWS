@@ -1,16 +1,6 @@
 env-setup/
-# Allow traversal of gpu-app-collection
-!gpu-app-collection/
-# Still ignore everything else inside gpu-app-collection
-gpu-app-collection/*
-# Specifically unignore custom-divergence-bms
-!gpu-app-collection/src/
-gpu-app-collection/src/*
-!gpu-app-collection/src/cuda/
-gpu-app-collection/src/cuda/*
-!gpu-app-collection/src/cuda/custom-divergence-bms/
 hw_run/
-sim_run_*
+sim_run_*/
 *.DS_Store*
 *.csv
 *.csv#
@@ -18,10 +8,19 @@ sim_run_*
 gpucomputingsdk_4.2.9_linux.run
 util/job_launching/*.txt
 gpu-simulator/gpgpu-sim
-.vscode/*
-extern
+.vscode/
+extern/
 gpu-simulator/accel_sim.pyi
 compile_commands.json
-.cache
+.cache/
 .cursorrules
 CLAUDE.md
+
+# Ignore everything in gpu-app-collection by default
+gpu-app-collection/**
+
+# Re-allow only the path you actually want
+!gpu-app-collection/src/
+!gpu-app-collection/src/cuda/
+!gpu-app-collection/src/cuda/custom-divergence-bms/
+!gpu-app-collection/src/cuda/custom-divergence-bms/**
