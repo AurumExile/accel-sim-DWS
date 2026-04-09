@@ -4,7 +4,7 @@
 // Columbia
 // All rights reserved.
 //
-// Redistribution and use in source and binary forms, with or without
+// Redistribution and_ use in source and binary forms, with or without
 // modification, are permitted provided that the following conditions are met:
 //
 // 1. Redistributions of source code must retain the above copyright notice,
@@ -63,30 +63,33 @@ const trace_warp_inst_t *trace_shd_warp_t::get_next_trace_inst(
     return NULL;
   }
 
-  // skip over trace instructions that belong to the opposite path of a branch.
-  while (m_splits[split_id].pc < warp_traces.size()) {
-    unsigned current_trace_pc = m_splits[split_id].pc;
+  // CRITICAL: Use trace_index here, NOT pc!
+  while (m_splits[split_id].trace_index < warp_traces.size()) {
+    unsigned current_trace_pc = m_splits[split_id].trace_index;
 
     trace_warp_inst_t *new_inst =
         new trace_warp_inst_t(get_shader()->get_config());
     new_inst->parse_from_trace_struct(
         warp_traces[current_trace_pc], m_kernel_info->OpcodeMap,
         m_kernel_info->m_tconfig, m_kernel_info->m_kernel_trace_info);
+    new_inst->set_warp_id(this->get_warp_id());
 
     active_mask_t trace_native_mask = new_inst->get_active_mask();
 
-    // If the hardware trace mask has zero overlap with our split this instruction is for a different path
+    // If the hardware trace mask has zero overlap with our split, skip it
     if ((trace_native_mask & m_splits[split_id].active_threads).none()) {
-      m_splits[split_id].pc++;
-      delete new_inst; 
-      continue;     
+      m_splits[split_id].trace_index++;  // Increment trace_index!
+      delete new_inst;
+      continue;
     }
 
-    // DWS DIVERGENCE DETECTION
+    // --- DWS Divergence Detection ---
     if ((trace_native_mask & m_splits[split_id].active_threads) !=
         m_splits[split_id].active_threads) {
-      active_mask_t taken_mask = trace_native_mask & m_splits[split_id].active_threads;
-      active_mask_t not_taken_mask = m_splits[split_id].active_threads ^ taken_mask;
+      active_mask_t taken_mask =
+          trace_native_mask & m_splits[split_id].active_threads;
+      active_mask_t not_taken_mask =
+          m_splits[split_id].active_threads ^ taken_mask;
 
       m_splits[split_id].active_threads = taken_mask;
 
@@ -98,36 +101,39 @@ const trace_warp_inst_t *trace_shd_warp_t::get_next_trace_inst(
         }
       }
 
-      unsigned scan_pc = current_trace_pc + 1;
+      unsigned scan_pc = current_trace_pc + 1;  // This is a trace index
       bool found_else_path = false;
 
       while (scan_pc < warp_traces.size()) {
-        // We need to decode the raw trace struct to see the mask
-        trace_warp_inst_t *dummy_inst = new trace_warp_inst_t(get_shader()->get_config());
-        dummy_inst->parse_from_trace_struct(warp_traces[scan_pc], m_kernel_info->OpcodeMap, m_kernel_info->m_tconfig, m_kernel_info->m_kernel_trace_info);
-
-        active_mask_t future_mask = dummy_inst->get_active_mask();
-
+        active_mask_t future_mask = warp_traces[scan_pc].mask;
         if ((future_mask & not_taken_mask).any()) {
           found_else_path = true;
-          delete dummy_inst;
           break;
         }
-
-        delete dummy_inst;
         scan_pc++;
       }
 
       if (found_else_path) {
-        spawn_split(new_split_id, scan_pc, not_taken_mask);
+        // Pass the actual memory PC from the trace, AND the trace index
+        spawn_split(new_split_id, warp_traces[scan_pc].m_pc, scan_pc,
+                    not_taken_mask);
       } else {
-        spawn_split(new_split_id, warp_traces.size(), not_taken_mask);
+        // -1 acts as the finish flag for the PC
+        spawn_split(new_split_id, (address_type)-1, warp_traces.size(),
+                    not_taken_mask);
       }
+      printf(
+          "[DWS-SPAWN] Cycle: %llu | Warp: %u | Parent Split: %u -> Spawned "
+          "New Split: %u | "
+          "Div PC: 0x%llx | Parent Mask: %s | New Split Mask: %s\n",
+          get_shader()->get_gpu()->gpu_sim_cycle, get_warp_id(), split_id,
+          new_split_id, warp_traces[current_trace_pc].m_pc,
+          taken_mask.to_string().c_str(), not_taken_mask.to_string().c_str());
     }
 
     // Apply this split's specific mask and advance
     new_inst->set_active(m_splits[split_id].active_threads);
-    m_splits[split_id].pc++;
+    m_splits[split_id].trace_index++;  // Increment trace_index!
 
     return new_inst;
   }
@@ -135,17 +141,14 @@ const trace_warp_inst_t *trace_shd_warp_t::get_next_trace_inst(
   return NULL;  // Reached end of trace
 }
 
-void trace_shd_warp_t::clear() {
-  m_splits.clear();
-  warp_traces.clear();
-}
+void trace_shd_warp_t::clear() { warp_traces.clear(); }
 
 bool trace_shd_warp_t::trace_done() {
   // The warp is only done if all valid splits have reached the end of the trace
   if (m_splits.empty()) return false;
 
   for (const auto &split : m_splits) {
-    if (split.is_valid && split.pc < warp_traces.size()) {
+    if (split.is_valid && split.trace_index < warp_traces.size()) {
       return false;
     }
   }
@@ -158,14 +161,17 @@ address_type trace_shd_warp_t::get_start_trace_pc() {
 }
 
 address_type trace_shd_warp_t::get_pc(unsigned split_id) const {
-  assert(warp_traces.size() > 0);
   assert(split_id < m_splits.size() && m_splits[split_id].is_valid);
 
-  unsigned t_pc = m_splits[split_id].pc;
-  if (t_pc < warp_traces.size()) {
-    return warp_traces[t_pc].m_pc;  // Return actual memory PC, not trace index
+  // FIX: Extract trace_index, not pc
+  unsigned t_idx = m_splits[split_id].trace_index;
+  if (t_idx < warp_traces.size()) {
+    return warp_traces[t_idx].m_pc;  // Return actual memory PC
+  } else if (!warp_traces.empty()) {
+    return warp_traces.back()
+        .m_pc;  // Trace done: Return last valid PC to prevent 0x0 fetches
   }
-  return 0;
+  return (address_type)-1;  // Trace empty from the start
 }
 
 trace_kernel_info_t::trace_kernel_info_t(dim3 gridDim, dim3 blockDim,
@@ -247,6 +253,7 @@ bool trace_warp_inst_t::parse_from_trace_struct(
 
   // fill and initialize common params
   m_decoded = true;
+  m_empty = false;
   pc = (address_type)trace.m_pc;
 
   isize =
@@ -651,61 +658,29 @@ unsigned trace_shader_core_ctx::sim_init_thread(
 void trace_shader_core_ctx::init_warps(unsigned cta_id, unsigned start_thread,
                                        unsigned end_thread, unsigned ctaid,
                                        int cta_size, kernel_info_t &kernel) {
-  // call base class
   shader_core_ctx::init_warps(cta_id, start_thread, end_thread, ctaid, cta_size,
                               kernel);
 
-  // then init traces
   unsigned start_warp = start_thread / m_config->warp_size;
   unsigned end_warp = end_thread / m_config->warp_size +
                       ((end_thread % m_config->warp_size) ? 1 : 0);
 
-  init_traces(start_warp, end_warp, kernel);
-}
-
-const warp_inst_t *trace_shader_core_ctx::get_next_inst(unsigned warp_id,
-                                                        unsigned split_id,
-                                                        address_type pc) {
-  //  Cast the base warp pointer to our trace-driven class
-  trace_shd_warp_t *m_trace_warp =
-      static_cast<trace_shd_warp_t *>(m_warp[warp_id]);
-
-  //  Fetch the next instruction specifically for the requested sub-warp (split)
-  // This function (defined earlier) handles the trace-index incrementing for
-  // this split.
-  const trace_warp_inst_t *ret = m_trace_warp->get_next_trace_inst(split_id);
-
-  //  Check for Warp Retirement
-  // A hardware warp slot can only be retired if:
-  //   - The frontend has no more instructions (ret == NULL)
-  //   - ALL splits belonging to this warp are done (m_trace_warp->trace_done())
-  if (ret == NULL && m_trace_warp->trace_done()) {
-    //  Structural Hazard / Pipeline Check
-    if (!m_warp[warp_id]->inst_in_pipeline() &&
-        m_warp[warp_id]->stores_done() &&
-        !m_scoreboard->pendingWrites(warp_id)) {
-      // 5. Finalize Thread Completion
-      // Iterate through all physical lanes. if they were active in any split,
-      // mark them as completed to update occupancy stats.
-      for (unsigned t = 0; t < m_warp_size; t++) {
-        if (m_warp[warp_id]->test_active(t)) {
-          m_warp[warp_id]->set_completed(t);
-        }
+  // Force Hardware Initialization so ID is not -1
+  for (unsigned i = start_warp; i < end_warp; ++i) {
+    active_mask_t active_threads;
+    for (unsigned t = 0; t < m_config->warp_size; t++) {
+      unsigned hwtid = i * m_config->warp_size + t;
+      if (hwtid < end_thread) {
+        active_threads.set(t);
       }
-
-      // 6. Release hardware resources
-      // Notify the barrier manager that this warp ID is now free for a new CTA.
-      m_barriers.warp_exit(warp_id);
     }
+    m_warp[i]->reset();
+    m_warp[i]->init(0, cta_id, i, active_threads, m_dynamic_warp_id,
+                    kernel.get_streamID());
+    m_dynamic_warp_id++;
   }
 
-  // Return the instruction (or NULL if this split is finished/stalled)
-  return ret;
-}
-
-void trace_shader_core_ctx::updateSIMTStack(unsigned warpId,
-                                            warp_inst_t *inst) {
-  // No SIMT-stack logic needed for trace-driven DWS
+  init_traces(start_warp, end_warp, kernel);
 }
 
 void trace_shader_core_ctx::init_traces(unsigned start_warp, unsigned end_warp,
@@ -716,6 +691,7 @@ void trace_shader_core_ctx::init_traces(unsigned start_warp, unsigned end_warp,
     m_trace_warp->clear();
     threadblock_traces.push_back(&(m_trace_warp->warp_traces));
   }
+
   trace_kernel_info_t &trace_kernel =
       static_cast<trace_kernel_info_t &>(kernel);
   trace_kernel.get_next_threadblock_traces(threadblock_traces);
@@ -723,13 +699,70 @@ void trace_shader_core_ctx::init_traces(unsigned start_warp, unsigned end_warp,
   for (unsigned i = start_warp; i < end_warp; ++i) {
     trace_shd_warp_t *m_trace_warp = static_cast<trace_shd_warp_t *>(m_warp[i]);
 
-    // DWS: set_next_pc now takes a split_id. We initialize Split 0 to start at
-    // trace index 0.
-    m_trace_warp->reset();
-    m_trace_warp->set_next_pc(0, 0);
+    // Keep the PC as array index 0
+    m_trace_warp->m_splits[0].is_valid = true;
+    m_trace_warp->m_splits[0].split_id = 0;
+    m_trace_warp->m_splits[0].pc = 0;
+    //   m_trace_warp->m_splits[0].active_threads =
+    //   m_trace_warp->get_active_mask();
+    m_trace_warp->m_splits[0].waiting_on_memory = false;
 
+    m_trace_warp->set_next_pc(0, 0);
     m_trace_warp->set_kernel(&trace_kernel);
+
+    address_type real_start_pc = 0;
+    if (!m_trace_warp->warp_traces.empty()) {
+      real_start_pc = m_trace_warp->warp_traces[0].m_pc;
+    }
+    printf(
+        "[DWS-BOOT] Warp %u initialized. Array Index: 0 -> Real Memory PC: "
+        "0x%llx\n",
+        i, real_start_pc);
+    fflush(stdout);
   }
+}
+
+// translate the index to the real memory address
+address_type trace_shd_warp_t::get_pc() const {
+  for (const auto &split : m_splits) {
+    // FIX: Evaluate and index using trace_index, not pc
+    if (split.is_valid && split.trace_index < warp_traces.size()) {
+      return warp_traces[split.trace_index].m_pc;
+    }
+  }
+  // DWS: Return -1 to stop the Fetch Unit from looping on the last instruction
+  return (address_type)-1;
+}
+
+const warp_inst_t *trace_shader_core_ctx::get_next_inst(unsigned warp_id,
+                                                        unsigned split_id,
+                                                        address_type pc) {
+  trace_shd_warp_t *m_trace_warp =
+      static_cast<trace_shd_warp_t *>(m_warp[warp_id]);
+
+  // Safety Check: If the split is already dead or the PC is the "Finish Flag"
+  // (-1), return NULL immediately so the Decode stage doesn't process garbage.
+  if (split_id >= m_trace_warp->m_splits.size() ||
+      !m_trace_warp->m_splits[split_id].is_valid || pc == (address_type)-1) {
+    return NULL;
+  }
+
+  // Attempt to fetch the next instruction from the trace using trace_index
+  const trace_warp_inst_t *ret = m_trace_warp->get_next_trace_inst(split_id);
+
+  // If ret is NULL, the trace is exhausted for this split.
+  // We DO NOT set is_valid = false here, because the I-Buffer might still
+  // contain instructions that need to be scheduled. The backend
+  // (warp_inst_complete / func_exec_inst) or standard GPGPU-Sim hardware_done()
+  // logic will naturally handle the warp's retirement once the pipeline
+  // completely drains.
+
+  return ret;
+}
+
+void trace_shader_core_ctx::updateSIMTStack(unsigned warpId,
+                                            warp_inst_t *inst) {
+  // No SIMT-stack logic needed for trace-driven DWS
 }
 
 void trace_shader_core_ctx::checkExecutionStatusAndUpdate(warp_inst_t &inst,
@@ -772,5 +805,5 @@ void trace_shader_core_ctx::issue_warp(register_set &warp,
 
   // delete warp_inst_t class here, it is not required anymore by gpgpu-sim
   // after issue
-  delete pI;
+   delete pI;
 }

@@ -66,11 +66,17 @@ class trace_warp_inst_t : public warp_inst_t {
   trace_warp_inst_t() {
     m_opcode = 0;
     should_do_atomic = false;
+    issue_cycle = 0; 
+    cycles = 0;
+    m_scheduler_id = 0;    
   }
 
   trace_warp_inst_t(const class core_config *config) : warp_inst_t(config) {
     m_opcode = 0;
     should_do_atomic = false;
+    issue_cycle = 0; 
+    cycles = 0; 
+    m_scheduler_id = 0;   
   }
 
   bool parse_from_trace_struct(
@@ -145,6 +151,8 @@ class trace_shd_warp_t : public shd_warp_t {
     trace_pc = 0;
     m_kernel_info = NULL;
   }
+
+  virtual address_type get_pc() const override;
 
   std::vector<inst_trace_t> warp_traces;
   const trace_warp_inst_t *get_next_trace_inst(unsigned split_id);
