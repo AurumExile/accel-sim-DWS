@@ -152,6 +152,11 @@ class trace_shd_warp_t : public shd_warp_t {
     m_kernel_info = NULL;
   }
 
+  bool is_split_finished(unsigned split_id) const override {
+    if (split_id >= m_splits.size() || !m_splits[split_id].is_valid) return false;
+    return m_splits[split_id].trace_index >= warp_traces.size();
+  }
+
   virtual address_type get_pc() const override;
 
   std::vector<inst_trace_t> warp_traces;

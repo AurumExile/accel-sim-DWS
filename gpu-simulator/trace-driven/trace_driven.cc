@@ -57,18 +57,16 @@
 #include "option_parser.h"
 #include "trace_driven.h"
 
-const trace_warp_inst_t *trace_shd_warp_t::get_next_trace_inst(
-    unsigned split_id) {
-  if (split_id >= m_splits.size() || !m_splits[split_id].is_valid) {
+const trace_warp_inst_t *trace_shd_warp_t::get_next_trace_inst(unsigned split_id) {
+  if (split_id >= m_splits.size() || !m_splits[split_id].is_valid || m_splits[split_id].at_barrier) {
     return NULL;
   }
 
-  // CRITICAL: Use trace_index here, NOT pc!
+  // Use trace_index here, NOT pc
   while (m_splits[split_id].trace_index < warp_traces.size()) {
     unsigned current_trace_pc = m_splits[split_id].trace_index;
 
-    trace_warp_inst_t *new_inst =
-        new trace_warp_inst_t(get_shader()->get_config());
+    trace_warp_inst_t *new_inst = new trace_warp_inst_t(get_shader()->get_config());
     new_inst->parse_from_trace_struct(
         warp_traces[current_trace_pc], m_kernel_info->OpcodeMap,
         m_kernel_info->m_tconfig, m_kernel_info->m_kernel_trace_info);
@@ -84,12 +82,9 @@ const trace_warp_inst_t *trace_shd_warp_t::get_next_trace_inst(
     }
 
     // --- DWS Divergence Detection ---
-    if ((trace_native_mask & m_splits[split_id].active_threads) !=
-        m_splits[split_id].active_threads) {
-      active_mask_t taken_mask =
-          trace_native_mask & m_splits[split_id].active_threads;
-      active_mask_t not_taken_mask =
-          m_splits[split_id].active_threads ^ taken_mask;
+    if ((trace_native_mask & m_splits[split_id].active_threads) != m_splits[split_id].active_threads) {
+      active_mask_t taken_mask = trace_native_mask & m_splits[split_id].active_threads;
+      active_mask_t not_taken_mask = m_splits[split_id].active_threads ^ taken_mask;
 
       m_splits[split_id].active_threads = taken_mask;
 
@@ -113,30 +108,65 @@ const trace_warp_inst_t *trace_shd_warp_t::get_next_trace_inst(
         scan_pc++;
       }
 
+      // -------------------------------------------------------------
+      // THE FIX: Define max_splits OUTSIDE the if/else blocks
+      // -------------------------------------------------------------
+      unsigned max_splits = get_shader()->get_config()->gpgpu_max_hw_splits;
+
       if (found_else_path) {
-        // Pass the actual memory PC from the trace, AND the trace index
-        spawn_split(new_split_id, warp_traces[scan_pc].m_pc, scan_pc,
-                    not_taken_mask);
+        if (get_num_active_hw_splits() < max_splits) {
+          // Spawn it immediately
+          spawn_split(new_split_id, warp_traces[scan_pc].m_pc, scan_pc, not_taken_mask);
+
+          printf(
+              "[DWS-SPAWN] Core: %u | Cycle: %llu | Warp: %u | Parent Split: "
+              "%u -> Spawned New Split: %u | Div PC: 0x%llx | Parent Mask: %s "
+              "| New Split Mask: %s\n",
+              get_shader()->get_sid(), get_shader()->get_gpu()->gpu_sim_cycle,
+              get_warp_id(), split_id, new_split_id,
+              (unsigned long long)warp_traces[current_trace_pc].m_pc,
+              taken_mask.to_string().c_str(),
+              not_taken_mask.to_string().c_str());
+        } else {
+          // We hit the hardware wall. Queue it for later.
+          warp_split_t pending_split;
+          pending_split.pc = warp_traces[scan_pc].m_pc;
+          pending_split.trace_index = scan_pc;
+          pending_split.active_threads = not_taken_mask;
+          m_pending_splits.push(pending_split);
+
+          printf(
+              "[DWS-STALL] Core: %u | Cycle: %llu | Warp: %u hit HW limit of "
+              "%u splits. Queued PC: 0x%llx\n",
+              get_shader()->get_sid(), get_shader()->get_gpu()->gpu_sim_cycle,
+              get_warp_id(), max_splits, (unsigned long long)pending_split.pc);
+        }
       } else {
-        // -1 acts as the finish flag for the PC
-        spawn_split(new_split_id, (address_type)-1, warp_traces.size(),
-                    not_taken_mask);
+        // Handle the -1 End of Trace divergence identically
+        if (get_num_active_hw_splits() < max_splits) {
+          spawn_split(new_split_id, (address_type)-1, warp_traces.size(), not_taken_mask);
+        } else {
+          warp_split_t pending_split;
+          pending_split.pc = (address_type)-1;
+          pending_split.trace_index = warp_traces.size();
+          pending_split.active_threads = not_taken_mask;
+          m_pending_splits.push(pending_split);
+
+          printf(
+              "[DWS-STALL] Core: %u | Cycle: %llu | Warp: %u hit HW limit of "
+              "%u splits. Queued End-of-Trace PC.\n",
+              get_shader()->get_sid(), get_shader()->get_gpu()->gpu_sim_cycle,
+              get_warp_id(), max_splits);
+        }
       }
-      printf(
-          "[DWS-SPAWN] Cycle: %llu | Warp: %u | Parent Split: %u -> Spawned "
-          "New Split: %u | "
-          "Div PC: 0x%llx | Parent Mask: %s | New Split Mask: %s\n",
-          get_shader()->get_gpu()->gpu_sim_cycle, get_warp_id(), split_id,
-          new_split_id, warp_traces[current_trace_pc].m_pc,
-          taken_mask.to_string().c_str(), not_taken_mask.to_string().c_str());
-    }
+    } // End of Divergence Detection
 
     // Apply this split's specific mask and advance
     new_inst->set_active(m_splits[split_id].active_threads);
     m_splits[split_id].trace_index++;  // Increment trace_index!
 
     return new_inst;
-  }
+  } // End of While Loop
 
   return NULL;  // Reached end of trace
 }
@@ -144,7 +174,8 @@ const trace_warp_inst_t *trace_shd_warp_t::get_next_trace_inst(
 void trace_shd_warp_t::clear() { warp_traces.clear(); }
 
 bool trace_shd_warp_t::trace_done() {
-  // The warp is only done if all valid splits have reached the end of the trace
+  // The warp is only done if all valid splits have reached the end of the
+  // trace
   if (m_splits.empty()) return false;
 
   for (const auto &split : m_splits) {
@@ -163,13 +194,13 @@ address_type trace_shd_warp_t::get_start_trace_pc() {
 address_type trace_shd_warp_t::get_pc(unsigned split_id) const {
   assert(split_id < m_splits.size() && m_splits[split_id].is_valid);
 
-  // FIX: Extract trace_index, not pc
+  // Extract trace_index, not pc
   unsigned t_idx = m_splits[split_id].trace_index;
   if (t_idx < warp_traces.size()) {
     return warp_traces[t_idx].m_pc;  // Return actual memory PC
   } else if (!warp_traces.empty()) {
     return warp_traces.back()
-        .m_pc;  // Trace done: Return last valid PC to prevent 0x0 fetches
+        .m_pc;  // Trace done. Return last valid PC to prevent 0x0 fetches
   }
   return (address_type)-1;  // Trace empty from the start
 }
@@ -256,8 +287,8 @@ bool trace_warp_inst_t::parse_from_trace_struct(
   m_empty = false;
   pc = (address_type)trace.m_pc;
 
-  isize =
-      16;  // starting from MAXWELL isize=16 bytes (including the control bytes)
+  isize = 16;  // starting from MAXWELL isize=16 bytes (including the control
+               // bytes)
   for (unsigned i = 0; i < MAX_OUTPUT_VALUES; i++) {
     out[i] = 0;
   }
@@ -459,18 +490,19 @@ bool trace_warp_inst_t::parse_from_trace_struct(
       // barrier_type bar_type;
       // reduction_type red_type;
       break;
-    // LDGDEPBAR is to form a group containing the previous LDGSTS instructions
-    // that have not been grouped yet. In the implementation, a group number
-    // will be assigned once the instruction is met.
+    // LDGDEPBAR is to form a group containing the previous LDGSTS
+    // instructions that have not been grouped yet. In the implementation, a
+    // group number will be assigned once the instruction is met.
     case OP_LDGDEPBAR:
       m_is_ldgdepbar = true;
       break;
-    // DEPBAR is served as a warp-wise barrier that is only effective for LDGSTS
-    // instructions. It is associated with a immediate value. The immediate
-    // value indicates the last N LDGDEPBAR groups to not wait once the
-    // instruction is met. For example, if the immediate value is 1, then the
-    // last group is able to proceed even with DEPBAR present; if the immediate
-    // value is 0, then all of the groups need to finish before proceed.
+    // DEPBAR is served as a warp-wise barrier that is only effective for
+    // LDGSTS instructions. It is associated with a immediate value. The
+    // immediate value indicates the last N LDGDEPBAR groups to not wait once
+    // the instruction is met. For example, if the immediate value is 1, then
+    // the last group is able to proceed even with DEPBAR present; if the
+    // immediate value is 0, then all of the groups need to finish before
+    // proceed.
     case OP_DEPBAR:
       m_is_depbar = true;
       m_depbar_group_no = trace.imm;
@@ -724,42 +756,43 @@ void trace_shader_core_ctx::init_traces(unsigned start_warp, unsigned end_warp,
 
 // translate the index to the real memory address
 address_type trace_shd_warp_t::get_pc() const {
+  // 1. DWS PRIORITY FETCH: Look for splits that are valid AND NOT parked
   for (const auto &split : m_splits) {
-    // FIX: Evaluate and index using trace_index, not pc
+    if (split.is_valid && split.trace_index < warp_traces.size() && !split.at_barrier) {
+      return warp_traces[split.trace_index].m_pc;
+    }
+  }
+
+  // 2. FALLBACK: If EVERY valid split is parked at a barrier, 
+  // return a parked PC so the pipeline knows we are stalled safely.
+  for (const auto &split : m_splits) {
     if (split.is_valid && split.trace_index < warp_traces.size()) {
       return warp_traces[split.trace_index].m_pc;
     }
   }
-  // DWS: Return -1 to stop the Fetch Unit from looping on the last instruction
+
+  // 3. Trace is completely empty/finished
   return (address_type)-1;
 }
 
 const warp_inst_t *trace_shader_core_ctx::get_next_inst(unsigned warp_id,
-                                                        unsigned split_id,
-                                                        address_type pc) {
-  trace_shd_warp_t *m_trace_warp =
-      static_cast<trace_shd_warp_t *>(m_warp[warp_id]);
+  unsigned split_id,
+  address_type pc) {
+trace_shd_warp_t *m_trace_warp = static_cast<trace_shd_warp_t *>(m_warp[warp_id]);
 
-  // Safety Check: If the split is already dead or the PC is the "Finish Flag"
-  // (-1), return NULL immediately so the Decode stage doesn't process garbage.
-  if (split_id >= m_trace_warp->m_splits.size() ||
-      !m_trace_warp->m_splits[split_id].is_valid || pc == (address_type)-1) {
-    return NULL;
-  }
-
-  // Attempt to fetch the next instruction from the trace using trace_index
-  const trace_warp_inst_t *ret = m_trace_warp->get_next_trace_inst(split_id);
-
-  // If ret is NULL, the trace is exhausted for this split.
-  // We DO NOT set is_valid = false here, because the I-Buffer might still
-  // contain instructions that need to be scheduled. The backend
-  // (warp_inst_complete / func_exec_inst) or standard GPGPU-Sim hardware_done()
-  // logic will naturally handle the warp's retirement once the pipeline
-  // completely drains.
-
-  return ret;
+// THE FIX: Add the at_barrier check to the safety abort!
+if (split_id >= m_trace_warp->m_splits.size() ||
+!m_trace_warp->m_splits[split_id].is_valid || 
+m_trace_warp->m_splits[split_id].at_barrier || 
+pc == (address_type)-1) {
+return NULL;
 }
 
+// Attempt to fetch the next instruction from the trace using trace_index
+const trace_warp_inst_t *ret = m_trace_warp->get_next_trace_inst(split_id);
+
+return ret;
+}
 void trace_shader_core_ctx::updateSIMTStack(unsigned warpId,
                                             warp_inst_t *inst) {
   // No SIMT-stack logic needed for trace-driven DWS
@@ -805,5 +838,5 @@ void trace_shader_core_ctx::issue_warp(register_set &warp,
 
   // delete warp_inst_t class here, it is not required anymore by gpgpu-sim
   // after issue
-   delete pI;
+  delete pI;
 }
