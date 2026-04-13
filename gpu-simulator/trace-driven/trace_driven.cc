@@ -112,9 +112,16 @@ const trace_warp_inst_t *trace_shd_warp_t::get_next_trace_inst(unsigned split_id
       // THE FIX: Define max_splits OUTSIDE the if/else blocks
       // -------------------------------------------------------------
       unsigned max_splits = get_shader()->get_config()->gpgpu_max_hw_splits;
-
+      
+      unsigned active_running_splits = 0;
+      for (const auto &s : m_splits) {
+          // Only count splits that are valid AND actively executing (not parked)
+          if (s.is_valid && !s.at_barrier) {
+              active_running_splits++;
+          }
+      }
       if (found_else_path) {
-        if (get_num_active_hw_splits() < max_splits) {
+        if (active_running_splits < max_splits) {
           // Spawn it immediately
           spawn_split(new_split_id, warp_traces[scan_pc].m_pc, scan_pc, not_taken_mask);
 
